@@ -1,0 +1,1 @@
+[{"name": "C2 K=8", "pd": {"channel": "fs", "power": "full"}, "K": 8}, {"name": "C3 Emax=5", "pd": {"channel": "los", "power": "par", "Emax": 5}, "K": 4}, {"name": "C3 Emax=150", "pd": {"channel": "los", "power": "par", "Emax": 150}, "K": 4}]

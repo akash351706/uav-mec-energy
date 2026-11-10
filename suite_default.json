@@ -1,0 +1,6 @@
+[
+ {"name":"C1 fs+par",  "pd":{"channel":"fs","power":"par"},  "K":4},
+ {"name":"C2 fs+full", "pd":{"channel":"fs","power":"full","eps":0.0}, "K":4},
+ {"name":"C3 los+par", "pd":{"channel":"los","power":"par"}, "K":4},
+ {"name":"C4 los+full","pd":{"channel":"los","power":"full","eps":0.0}, "K":4}
+]
