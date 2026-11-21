@@ -39,6 +39,7 @@ class Prm:
     b_los: float = 0.16
     etaL: float = 1.0
     etaN: float = 20.0
+    mu: float = 0.0           # weight of propulsion energy in the objective (0 = paper's original)
 
     @property
     def delta(self):
@@ -131,11 +132,31 @@ def budget(p):
     return (1 + p.eps) * prop_power(0.0, p)[0] * (p.N + 1) * p.delta
 
 
+def fly_grad(q, p):
+    """Gradient of the flight energy with respect to the N free positions (N,2)."""
+    N = p.N; d = p.delta
+    dd = np.diff(path(q), axis=0)
+    s2 = (dd ** 2).sum(1) / d ** 2
+    dP = prop_power(s2, p)[1]
+    gseg = 2 * dP[:, None] * dd / d
+    g = np.zeros((N, 2))
+    for n in range(N + 1):
+        if n + 1 <= N:
+            g[n] += -gseg[n]
+        if n >= 1:
+            g[n - 1] += gseg[n]
+    return g
+
+
 # ---------------------------------------------------------------- Step A
+def Lv(p):
+    return np.broadcast_to(np.asarray(p.L, float), (p.K,)).copy()
+
+
 def energy_terms(tau, Rm, p):
     O = p.delta * (Rm * tau).sum(1)
     tx = p.Pu * p.delta * tau.sum()
-    loc = p.cl * ((p.L - O) ** 3).sum()
+    loc = p.cl * ((Lv(p) - O) ** 3).sum()
     uav = p.cs * O.sum() ** 3
     return tx, loc, uav
 
@@ -144,15 +165,17 @@ def stepA(Rm, p, tau0=None):
     K, N = Rm.shape
     d = p.delta
 
+    LL = Lv(p)
+
     def obj(z):
         t = z.reshape(K, N)
         O = d * (Rm * t).sum(1)
-        return p.Pu * d * z.sum() + p.cl * ((p.L - O) ** 3).sum() + p.cs * O.sum() ** 3
+        return p.Pu * d * z.sum() + p.cl * ((LL - O) ** 3).sum() + p.cs * O.sum() ** 3
 
     def grad(z):
         t = z.reshape(K, N)
         O = d * (Rm * t).sum(1)
-        g = p.Pu * d - 3 * p.cl * (p.L - O)[:, None] ** 2 * d * Rm + 3 * p.cs * O.sum() ** 2 * d * Rm
+        g = p.Pu * d - 3 * p.cl * (LL - O)[:, None] ** 2 * d * Rm + 3 * p.cs * O.sum() ** 2 * d * Rm
         return g.ravel()
 
     # constraints: slot time (N), per-terminal volume (K)
@@ -162,7 +185,7 @@ def stepA(Rm, p, tau0=None):
     def cons(z):
         t = z.reshape(K, N)
         O = d * (Rm * t).sum(1)
-        return np.concatenate([1.0 - t.sum(0), p.L - O])
+        return np.concatenate([1.0 - t.sum(0), LL - O])
 
     def cjac(z):
         J2 = -d * Rm
@@ -186,7 +209,7 @@ def stepA(Rm, p, tau0=None):
         O = d * (Rm * t).sum(1)
         over = O > p.L
         if over.any():
-            t[over] *= (p.L / O[over])[:, None]
+            t[over] *= (LL[over] / O[over])[:, None]
         val = obj(t.ravel())
         if best is None or val < best[0] - 1e-12:
             best = (val, t)
@@ -223,14 +246,19 @@ def stepB(q, tau, w, p, mode="tangent", radius=None):
         return ((qq[None, :, :] - w[:, None, :]) ** 2).sum(2), qq
 
     def obj(z):
-        x, _ = X(z)
-        return p.Pu * (b * phi(x) * act).sum()
+        x, qq = X(z)
+        v = p.Pu * (b * phi(x) * act).sum()
+        if p.mu > 0:
+            v += p.mu * fly_energy(qq, p)
+        return v
 
     def grad(z):
         x, qq = X(z)
         coef = b * dphi(x) * act                                   # K,N
         diff = qq[None, :, :] - w[:, None, :]
         g = 2 * p.Pu * (coef[:, :, None] * diff).sum(0)
+        if p.mu > 0:
+            g = g + p.mu * fly_grad(qq, p)
         return g.ravel()
 
     def cons(z):
@@ -329,12 +357,12 @@ def evaluate(q, w, p, tau0=None):
     tau, J = stepA(Rm, p, tau0)
     tx, loc, uav = energy_terms(tau, Rm, p)
     O = p.delta * (Rm * tau).sum(1)
-    return dict(J=tx + loc + uav, tx=tx, loc=loc, uav=uav, off=float(O.sum() / (p.K * p.L)),
-                fly=fly_energy(q, p), tau=tau)
+    return dict(J=tx + loc + uav, tx=tx, loc=loc, uav=uav, off=float(O.sum() / Lv(p).sum()),
+                fly=fly_energy(q, p), tau=tau, Jtot=tx + loc + uav + p.mu * fly_energy(q, p))
 
 
 def local_energy(p):
-    return p.K * p.cl * p.L ** 3
+    return p.cl * (Lv(p) ** 3).sum()
 
 
 def bcd(w, p, q0, mode="tangent", maxit=15, tol=1e-5):
@@ -347,7 +375,7 @@ def bcd(w, p, q0, mode="tangent", maxit=15, tol=1e-5):
     radii = [None] if plain else [1.5 * p.V * p.delta, 0.75 * p.V * p.delta, 0.33 * p.V * p.delta]
     q = q0.copy()
     cur = evaluate(q, w, p)
-    hist = [cur["J"]]
+    hist = [cur["Jtot"]]
     for it in range(maxit):
         accepted = False
         for rad in radii:
@@ -355,10 +383,10 @@ def bcd(w, p, q0, mode="tangent", maxit=15, tol=1e-5):
             if qn is None:
                 continue
             new = evaluate(qn, w, p, cur["tau"])
-            if new["J"] < cur["J"] - 1e-9:
-                rel = (cur["J"] - new["J"]) / cur["J"]
+            if new["Jtot"] < cur["Jtot"] - 1e-9:
+                rel = (cur["Jtot"] - new["Jtot"]) / cur["Jtot"]
                 q, cur = qn, new
-                hist.append(cur["J"])
+                hist.append(cur["Jtot"])
                 accepted = True
                 break
         if not accepted or rel < tol:
@@ -369,14 +397,15 @@ def bcd(w, p, q0, mode="tangent", maxit=15, tol=1e-5):
     return cur
 
 
-def circle_init(w, p, direction=1):
+def circle_init(w, p, direction=1, vcap=None):
     """Largest feasible loop through the depot, centred towards the terminal centroid."""
     N = p.N
     cen = w.mean(0)
     u = cen / (np.linalg.norm(cen) + 1e-12)
     bud = budget(p)
     best = None
-    for r in np.linspace(0, p.V * (N + 1) * p.delta / (2 * np.pi), 120):
+    vv = p.V if vcap is None else min(vcap, p.V)
+    for r in np.linspace(0, vv * (N + 1) * p.delta / (2 * np.pi), 120):
         c = r * u
         ang0 = np.arctan2(-u[1], -u[0])
         th = ang0 + direction * 2 * np.pi * np.arange(1, N + 1) / (N + 1)
@@ -421,3 +450,45 @@ def run_all(w, p, methods=("local", "hover", "circle", "proposed", "ratelb")):
 
 def placements(n, Kmax=24, seed=2026, side=300.0):
     return [np.random.default_rng(seed + i).uniform(-side, side, (Kmax, 2)) for i in range(n)]
+
+
+VOPT = 10.2   # m/s, minimum-power speed of the rotary-wing model (Table 1 parameters)
+
+
+def run_joint(w, p):
+    """Compare designs under the joint objective  J = E_comm+comp + mu * E_fly.
+
+    hover      : UAV parked at the depot, bits optimised
+    loop       : fixed loop at the minimum-power speed (best of two directions / best centre), bits optimised
+    comm_only  : the original algorithm (mu = 0 in the trajectory step, same budget), evaluated with mu
+    joint      : BCD with the propulsion energy in the trajectory objective (three starts, best kept)
+    """
+    N = p.N
+    z = np.zeros((N, 2))
+    out = {}
+    out["hover"] = evaluate(z, w, p)
+    cands = []
+    for dr in (1, -1):
+        qc = circle_init(w, p, dr, vcap=VOPT)
+        cands.append((evaluate(qc, w, p), qc))
+    ev, qloop = min(cands, key=lambda c: c[0]["Jtot"])
+    out["loop"] = ev
+    # communication-only design under the same budget, then re-scored with mu
+    p0 = replace(p, mu=0.0)
+    t0 = time.time()
+    r = bcd(w, p0, qloop, "tangent")
+    r1 = bcd(w, p0, z, "tangent")
+    if r1["J"] < r["J"]:
+        r = r1
+    ev = evaluate(r["q"], w, p)            # same trajectory, scored with mu
+    ev["q"] = r["q"]; ev["time"] = time.time() - t0
+    out["comm_only"] = ev
+    t0 = time.time()
+    best = None
+    for q0 in (qloop, z):
+        rr = bcd(w, p, q0, "tangent")
+        if best is None or rr["Jtot"] < best["Jtot"]:
+            best = rr
+    best["time"] = time.time() - t0
+    out["joint"] = best
+    return out
